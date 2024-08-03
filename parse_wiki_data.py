@@ -9,117 +9,94 @@ headers = {
     'user-agent': 'NoobToMax/0.1 (MacOS; Sonoma 14.5)    Contact: liampowers@u.northwestern.edu    Repo: https://github.com/liam-powers/NoobToMax-API'
 }
 
-def get_all_quests() -> typing.List[str]:
-    all_quests = []
-    query_quests_url = 'https://oldschool.runescape.wiki/api.php?action=query&list=categorymembers&cmtitle=Category:Quests&cmlimit=500&format=json&formatversion=2'
-    response = requests.get(query_quests_url, headers=headers)
+class Quest:
+    def __init__(self, title):
+        self.title = title
+        self.direct_prereqs = []
 
-    if response.status_code != 200:
-        print('Status code not equal to 200! Uh oh!')
-        return all_quests
+    def set_direct_prereqs(self) -> None:
+        quest_URL = 'https://oldschool.runescape.wiki/api.php?action=query&prop=revisions&rvprop=content&titles=' + self.title + '&format=json&formatversion=2'
+        response = requests.get(quest_URL, headers=headers)
 
-    py_response = response.json()
-    response_text_content = py_response['query']['categorymembers']
+        py_response = response.json()
+        if (response.status_code != 200):
+            return
 
-    for quest_dict in response_text_content:
-        quest_title = quest_dict['title']
-        if not (quest_title.startswith('Quest') or quest_title.startswith('Category') or quest_title.startswith('User')):
-            all_quests.append(quest_dict['title'])
+        quest_page_wikicontent = py_response['query']['pages'][0]['revisions'][0]['content']
+        wikicode = mwparserfromhell.parse(quest_page_wikicontent)
 
-    return all_quests
+        templates = wikicode.filter_templates()
+        quest_template = None
 
-def get_quest_prereqs(quest_name: str, tid: int, quest_to_prereqs: dict, lock: threading.Lock, all_quests: typing.List[str]) -> None:
-    print(f'thread {tid} in get_all_quests')
-    quest_URL = 'https://oldschool.runescape.wiki/api.php?action=query&prop=revisions&rvprop=content&titles=' + quest_name + '&format=json&formatversion=2'
-    response = requests.get(quest_URL, headers=headers)
+        for template in templates:
+            if template.name.strip() == 'Quest details':
+                quest_template = template
 
-    py_response = response.json()
-    if (response.status_code != 200):
-        print('Status code not equal to 200! Uh oh!')
-        print(response.text)
-        print(response.status_code)
-        return
+        direct_prereqs = []
+        if quest_template:
+            for param in quest_template.params:
+                if param.name.strip() == 'requirements':
+                    quest_text = str(param.value)
+                    unclean_quests = quest_text.split('\n')
 
-    sample_quest_textcontent = py_response['query']['pages'][0]['revisions'][0]['content']
-    wikicode = mwparserfromhell.parse(sample_quest_textcontent)
+                    for unclean_quest in unclean_quests:
+                        num_stars = unclean_quest.count('*')
+                        clean_quest = clean_quest_text(unclean_quest)
+                        if not clean_quest:
+                            continue
+                        if num_stars == 2:
+                            direct_prereqs.append(clean_quest)
 
-    templates = wikicode.filter_templates()
-    template_names = []
-    quest_template = None
+        self.direct_prereqs = direct_prereqs
 
-    for template in templates:
-        template_names.append(template.name)
-        if template.name.strip() == 'Quest details':
-            quest_template = template
+class QuestTree:
+    def __init__(self):
+        self.all_quest_titles = []
+        self.idx_to_quest = {}
 
-    quest_prereqs = []
-    quest_prereqs_textcontent = None
-    if quest_template:
-        for param in quest_template.params:
-            if param.name.strip() == "requirements":
-                quest_prereqs_textcontent = param.value
-                quest_prereqs = [
-                    str(quest.title)
-                    for quest in param.value.filter_wikilinks()
-                    if str(quest.title) in all_quests
-                ]
+    def set_all_quest_titles(self) -> None:
+        all_quest_titles = []
+        query_quests_url = 'https://oldschool.runescape.wiki/api.php?action=query&list=categorymembers&cmtitle=Category:Quests&cmlimit=500&format=json&formatversion=2'
+        response = requests.get(query_quests_url, headers=headers)
 
-    with lock:
-        quest_to_prereqs[quest_name]["prereqs"] = quest_prereqs
-        quest_to_prereqs[quest_name]["prereqs_textcontent"] = quest_prereqs_textcontent
+        if response.status_code != 200:
+            return
 
-def clean_quest_text(uncleaned_quest: str) -> str:
+        py_response = response.json()
+        response_text_content = py_response['query']['categorymembers']
+
+        for quest_dict in response_text_content:
+            quest_title = quest_dict['title']
+            if not (quest_title.startswith('Quest') or quest_title.startswith('Category') or quest_title.startswith('User')):
+                all_quest_titles.append(quest_dict['title'])
+
+        self.all_quest_titles = all_quest_titles
+
+    def set_all_quest_objs(self) -> None:
+        idx_to_quest = { i: Quest(title=self.all_quest_titles[i]) for i in range(len(self.all_quest_titles)) }
+        id = 0
+        while id < len(idx_to_quest):
+            threads = []
+            for tid in range(id, min(id + 2, len(self.all_quest_titles))):
+                threads.append(threading.Thread(target=idx_to_quest[tid].set_direct_prereqs))
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            id += 2
+
+        self.idx_to_quest = idx_to_quest
+
+def clean_quest_text(uncleaned_quest: str):
     pattern = r'\[\[(.*?)\]\]'
-
     matches = re.findall(pattern, uncleaned_quest)
+    if len(matches) < 1:    # wasn't even quest text in the first place
+        return False
     return matches[0]
 
-def tier_quests(quest_text: str) -> dict:   # pass JUST the quest text (between completion of the following quests and the next single star)
-    tiered_quests = {}
+if __name__ == '__main__':
+    qt = QuestTree()
+    qt.set_all_quest_titles()
+    qt.set_all_quest_objs()
 
-    unclean_quests = quest_text.split('\n')
-    ancestors = []
-
-    for unclean_quest in unclean_quests:
-        num_stars = unclean_quest.count('*')
-        clean_quest = clean_quest_text(unclean_quest)
-        if num_stars == 2:
-            ancestors = []
-        elif num_stars <= len(ancestors):
-            ancestors = ancestors[:num_stars - 2]
-
-        curr_parent = tiered_quests
-        for ancestor in ancestors:
-            curr_parent = curr_parent[ancestor]
-        curr_parent[clean_quest] = {}
-        ancestors.append(clean_quest)
-
-    return tiered_quests
-
-# test for getting all quests names then getting their prereqs
-if __name__ == "__main__":
-    requirements_text = "** [[Pirate's Treasure]]\n** [[Rum Deal]]\n*** [[Zogre Flesh Eaters]]\n**** [[Big Chompy Bird Hunting]]\n**** [[Jungle Potion]]\n***** [[Druidic Ritual]]\n*** [[Priest in Peril]]"
-
-    print(tier_quests(requirements_text))
-    # all_quests = get_all_quests()
-    # print('all quests: ', all_quests)
-
-    # quest_to_prereqs = { quest: { "prereqs": [], "prereqs_textcontent": None } for quest in all_quests }
-
-    # lock = threading.Lock()
-
-    # id = 0
-    # while id < 10: # id < len(all_quests):
-    #     threads = []
-    #     for tid in range(id, min(id + 3, len(all_quests))):
-    #         threads.append(threading.Thread(target=get_quest_prereqs, args=(all_quests[tid], tid, quest_to_prereqs, lock, all_quests)))
-    #     for thread in threads:
-    #         thread.start()
-    #     for thread in threads:
-    #         thread.join()
-    #     id += 3
-
-
-    # for key, value in quest_to_prereqs.items():
-    #     if value['prereqs_textcontent']:
-    #         print(f'{key}: {value['prereqs_textcontent']}')
+    print(qt.idx_to_quest[0])
